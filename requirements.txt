@@ -1,0 +1,9 @@
+pandas
+requests
+beautifulsoup4
+selenium
+webdriver-manager
+nltk
+tqdm
+IMDbPY
+vaderSentiment
