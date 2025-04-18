@@ -1,136 +1,139 @@
 import os
-import random
-import requests
 import gzip
 import shutil
+import random
+import requests
+from typing import Dict, Any, Iterable
+
 import pandas as pd
-from bs4 import BeautifulSoup
 
-# Set the temporary directory for data storage
+# --------- CONSTANTS ---------
 DATA_DIR = "temp"
-# Use the ratings dataset instead of basics:
-GZ_FILENAME = "title.ratings.tsv.gz"
-TSV_FILENAME = "title.ratings.tsv"
-GZ_FILEPATH = os.path.join(DATA_DIR, GZ_FILENAME)
-TSV_FILEPATH = os.path.join(DATA_DIR, TSV_FILENAME)
-# Ratings dataset URL:
-IMDB_RATINGS_URL = "https://datasets.imdbws.com/title.ratings.tsv.gz"
+DATASETS = {
+    "ratings": {
+        "gz": "title.ratings.tsv.gz",
+        "url": "https://datasets.imdbws.com/title.ratings.tsv.gz",
+    },
+    "basics": {
+        "gz": "title.basics.tsv.gz",
+        "url": "https://datasets.imdbws.com/title.basics.tsv.gz",
+    },
+    "crew": {
+        "gz": "title.crew.tsv.gz",
+        "url": "https://datasets.imdbws.com/title.crew.tsv.gz",
+    },
+}
 
-# Internal storage for movie ids that satisfy the min_votes threshold.
-_movie_ids = []
+# --------- INTERNAL STATE ---------
+_metadata_df: pd.DataFrame | None = None  # lazily built, merged dataframe
+_remaining_ids: list[str] = []  # ids left to sample from
 
-def _download_and_extract():
-    """Download and extract the IMDb ratings dataset if not already done."""
+# --------- HELPERS ---------
+
+def _ensure_dir() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
-    
-    # Download the gzip file if it doesn't exist
-    if not os.path.exists(GZ_FILEPATH):
-        print("Downloading ratings dataset...")
-        response = requests.get(IMDB_RATINGS_URL, stream=True)
-        response.raise_for_status()  # Ensure we notice bad responses
-        with open(GZ_FILEPATH, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        print("Download completed.")
-    else:
-        print("GZ file already exists. Skipping download.")
-    
-    # Extract the file if the TSV doesn't exist
-    if not os.path.exists(TSV_FILEPATH):
-        print("Extracting ratings dataset...")
-        with gzip.open(GZ_FILEPATH, "rb") as f_in, open(TSV_FILEPATH, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out)
-        print("Extraction completed.")
-    else:
-        print("TSV file already exists. Skipping extraction.")
 
-def _load_movie_ids(min_votes=0):
-    """
-    Load movie ids (tconst) from the ratings TSV file into memory.
-    Only include movies with numVotes >= min_votes.
-    """
-    global _movie_ids
-    if _movie_ids:
+
+def _download_dataset(name: str) -> None:
+    """Download <name>.gz if missing."""
+    cfg = DATASETS[name]
+    gz_path = os.path.join(DATA_DIR, cfg["gz"])
+    if os.path.exists(gz_path):
         return
+    print(f"⬇️  Downloading {cfg['gz']} …")
+    with requests.get(cfg["url"], stream=True, timeout=60) as r:
+        r.raise_for_status()
+        with open(gz_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+    print("   done.")
 
-    _download_and_extract()
 
-    print("Loading movie IDs from the ratings dataset...")
-    with open(TSV_FILEPATH, "rt", encoding="utf-8") as file:
-        # Read header
-        header = file.readline().strip().split("\t")
-        try:
-            tconst_index = header.index("tconst")
-            numVotes_index = header.index("numVotes")
-        except ValueError:
-            raise Exception("Required columns not found in header.")
+def _extract_dataset(name: str) -> str:
+    """Extract .gz → .tsv if missing; return TSV path."""
+    cfg = DATASETS[name]
+    gz_path = os.path.join(DATA_DIR, cfg["gz"])
+    tsv_path = gz_path.replace(".gz", "")
+    if os.path.exists(tsv_path):
+        return tsv_path
+    print(f"🗜️  Extracting {cfg['gz']} …")
+    with gzip.open(gz_path, "rb") as f_in, open(tsv_path, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    print("   done.")
+    return tsv_path
 
-        # Read movie ids that meet the minimum votes threshold
-        for line in file:
-            parts = line.strip().split("\t")
-            if parts and len(parts) > max(tconst_index, numVotes_index):
-                try:
-                    votes = int(parts[numVotes_index])
-                except ValueError:
-                    continue  # Skip if numVotes is not an integer
-                if votes >= min_votes:
-                    _movie_ids.append(parts[tconst_index])
-    print(f"Loaded {len(_movie_ids)} movie IDs with at least {min_votes} votes.")
 
-def get_random_movie_id(min_votes=0):
-    """
-    Returns a random movie ID (tconst) from the IMDb ratings dataset that meets the min_votes threshold.
-    Each ID is only returned once. Raises an Exception when no IDs remain.
-    """
-    global _movie_ids
-    # Load movie ids if not already loaded.
-    if not _movie_ids:
-        _load_movie_ids(min_votes=min_votes)
+def _load_dataframe(name: str, usecols: Iterable[str] | None = None) -> pd.DataFrame:
+    """Ensure dataset present → return DataFrame."""
+    _ensure_dir()
+    _download_dataset(name)
+    tsv_path = _extract_dataset(name)
+    return pd.read_csv(
+        tsv_path,
+        sep="\t",
+        na_values="\\N",
+        low_memory=False,
+        usecols=usecols,
+    )
 
-    if not _movie_ids:
-        raise Exception("No more movie IDs available with the specified min_votes threshold.")
+# --------- PUBLIC API ---------
 
-    # Pick and remove a random movie id from the list
-    index = random.randrange(len(_movie_ids))
-    return _movie_ids.pop(index)
+def load_metadata(min_votes: int = 0) -> pd.DataFrame:
+    """Load & cache merged ratings+basics+crew, filtered by min_votes."""
+    global _metadata_df
+    if _metadata_df is not None:
+        return _metadata_df.copy()
 
-def scrape_worldwide_box_office(movie_id):
-    """
-    Scrapes the worldwide box office figure from Box Office Mojo for the given movie_id.
-    It searches for a span element containing "Worldwide", then gets its parent div and
-    looks for any child element with class "money" to extract the figure.
-    If the element is not found, an Exception is thrown.
-    """
-    url = f"https://www.boxofficemojo.com/title/{movie_id}/credits/"
-    
-    # Get the page content
-    response = requests.get(url)
-    if response.status_code != 200:
-        raise Exception(f"Failed to retrieve page for movie ID {movie_id} (status code: {response.status_code})")
-    
-    # Parse the HTML content
-    soup = BeautifulSoup(response.text, 'html.parser')
-    
-    # Find all span elements that contain the text "Worldwide"
-    worldwide_spans = soup.find_all('span', string=lambda text: text and "Worldwide" in text)
-    
-    # Loop through each span to find the parent div and then search for a child with class "money"
-    for span in worldwide_spans:
-        parent_div = span.find_parent('div')
-        if parent_div:
-            money_elem = parent_div.find(class_="money")
-            if money_elem:
-                # Return the box office figure (e.g., "$47,680,966")
-                return money_elem.get_text(strip=True)
-    
-    # If no matching element is found, throw an error
-    raise Exception("Worldwide box office figure not found.")
+    print("📖  Loading IMDb metadata …")
 
-# Example usage:
-# movie_id = "tt28607951"  # Replace with the actual movie ID
-# print(scrape_worldwide_box_office(movie_id))
+    ratings = _load_dataframe(
+        "ratings", usecols=["tconst", "averageRating", "numVotes"]
+    )
+    basics = _load_dataframe(
+        "basics",
+        usecols=[
+            "tconst",
+            "titleType",
+            "primaryTitle",
+            "originalTitle",
+            "isAdult",
+            "startYear",
+            "endYear",
+            "runtimeMinutes",
+            "genres",
+        ],
+    )
+    crew = _load_dataframe("crew", usecols=["tconst", "directors", "writers"])
 
-# Example usage of get_random_movie_id:
-# To only get movies with at least 1000 votes, call:
-# random_movie_id = get_random_movie_id(min_votes=1000)
-# print(random_movie_id)
+    df = (
+        ratings.merge(basics, on="tconst", how="left")
+        .merge(crew, on="tconst", how="left")
+        .rename(columns={"tconst": "movie_id"})
+    )
+
+    if min_votes > 0:
+        df = df[df["numVotes"] >= min_votes]
+
+    _metadata_df = df.reset_index(drop=True)
+    print(f"   {len(_metadata_df):,} rows ready.")
+    return _metadata_df.copy()
+
+
+def get_random_movie_id(min_votes: int = 0) -> str:
+    """Return random movie_id with ≥min_votes (unique per run)."""
+    global _remaining_ids
+    if not _remaining_ids:
+        md = load_metadata(min_votes)
+        _remaining_ids = md["movie_id"].tolist()
+        random.shuffle(_remaining_ids)
+    if not _remaining_ids:
+        raise RuntimeError("No movie IDs left that satisfy the threshold.")
+    return _remaining_ids.pop()
+
+
+def get_metadata(movie_id: str) -> Dict[str, Any]:
+    md = load_metadata()
+    row = md.loc[md["movie_id"] == movie_id]
+    if row.empty:
+        return {}
+    return row.iloc[0].to_dict()
